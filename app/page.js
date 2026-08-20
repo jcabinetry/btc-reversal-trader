@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const START = 100;
 const FEE = 0.006;
+const STORAGE_KEY = 'btc-reversal-paper-v2';
 
 function ema(values, n) {
   if (!values.length) return 0;
@@ -11,88 +12,209 @@ function ema(values, n) {
   return values.slice(1).reduce((v, x) => x * k + v * (1 - k), values[0]);
 }
 
+function initialAccount() {
+  return { cash: START, btc: 0, position: 'USD', entry: null, fees: 0, wins: 0, losses: 0, trades: [] };
+}
+
 export default function Home() {
   const [price, setPrice] = useState(null);
   const [status, setStatus] = useState('CONNECTING');
-  const [cash, setCash] = useState(START);
-  const [btc, setBtc] = useState(0);
   const [signal, setSignal] = useState('WAIT IN USD');
-  const [trades, setTrades] = useState([]);
-  const prices = useRef([]);
-  const position = useRef('USD');
-  const entry = useRef(null);
-  const lastTrade = useRef(0);
+  const [reason, setReason] = useState('Loading one minute BTC history');
+  const [candles, setCandles] = useState([]);
+  const [fast, setFast] = useState(null);
+  const [slow, setSlow] = useState(null);
+  const [account, setAccount] = useState(initialAccount());
+  const accountRef = useRef(account);
+  const lastCandleRef = useRef(null);
+  const loadedRef = useRef(false);
+
+  const saveAccount = next => {
+    accountRef.current = next;
+    setAccount(next);
+    if (typeof window !== 'undefined') localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  };
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        accountRef.current = { ...initialAccount(), ...parsed };
+        setAccount(accountRef.current);
+      }
+    } catch {}
+    loadedRef.current = true;
+  }, []);
 
   useEffect(() => {
     let timer;
+
     const load = async () => {
       try {
-        const r = await fetch('/api/price', { cache: 'no-store' });
+        const r = await fetch('/api/candles', { cache: 'no-store' });
         const d = await r.json();
-        if (!d.price) throw new Error('No price');
+        if (!d.price || !Array.isArray(d.candles)) throw new Error('No market data');
+
+        const list = d.candles;
         const p = Number(d.price);
         setPrice(p);
+        setCandles(list.slice(-60));
         setStatus('LIVE PAPER MODE');
-        prices.current = [...prices.current.slice(-59), p];
-        if (prices.current.length < 24 || Date.now() - lastTrade.current < 60000) return;
-        const fast = ema(prices.current.slice(-12), 7);
-        const slow = ema(prices.current.slice(-24), 18);
-        const prevFast = ema(prices.current.slice(-13, -1), 7);
-        const prevSlow = ema(prices.current.slice(-25, -1), 18);
-        const up = fast > slow && prevFast <= prevSlow;
-        const down = fast < slow && prevFast >= prevSlow;
-        if (position.current === 'USD' && up) {
-          setCash(c => {
-            const afterFee = c * (1 - FEE);
-            const qty = afterFee / p;
-            setBtc(qty);
-            position.current = 'BTC';
-            entry.current = p;
-            lastTrade.current = Date.now();
-            setSignal('HOLD BTC');
-            setTrades(t => [{ side: 'BUY', price: p, time: new Date().toLocaleTimeString(), value: c }, ...t].slice(0, 20));
-            return 0;
+
+        if (list.length < 24) {
+          setReason(`Waiting for candle history ${list.length}/24`);
+          return;
+        }
+
+        const closes = list.map(c => c.close);
+        const currentFast = ema(closes.slice(-24), 7);
+        const currentSlow = ema(closes.slice(-24), 18);
+        const previousFast = ema(closes.slice(-25, -1), 7);
+        const previousSlow = ema(closes.slice(-25, -1), 18);
+        setFast(currentFast);
+        setSlow(currentSlow);
+
+        const newest = list[list.length - 1];
+        const upCross = currentFast > currentSlow && previousFast <= previousSlow;
+        const downCross = currentFast < currentSlow && previousFast >= previousSlow;
+        const trend = currentFast > currentSlow ? 'UP' : 'DOWN';
+
+        if (lastCandleRef.current === newest.time) {
+          setSignal(accountRef.current.position === 'BTC' ? 'HOLD BTC' : 'WAIT IN USD');
+          setReason(`Trend ${trend}. Waiting for the next completed one minute candle.`);
+          return;
+        }
+        lastCandleRef.current = newest.time;
+
+        if (!loadedRef.current) return;
+
+        const a = accountRef.current;
+        if (a.position === 'USD' && upCross && a.cash > 0) {
+          const fee = a.cash * FEE;
+          const spendable = a.cash - fee;
+          const qty = spendable / newest.close;
+          const trade = {
+            side: 'BUY',
+            price: newest.close,
+            value: a.cash,
+            fee,
+            time: new Date(newest.time * 1000).toLocaleString(),
+            reason: 'Fast EMA crossed above slow EMA on a completed one minute candle'
+          };
+          saveAccount({
+            ...a,
+            cash: 0,
+            btc: qty,
+            position: 'BTC',
+            entry: newest.close,
+            fees: a.fees + fee,
+            trades: [trade, ...a.trades].slice(0, 50)
           });
-        } else if (position.current === 'BTC' && down) {
-          setBtc(q => {
-            const proceeds = q * p * (1 - FEE);
-            setCash(proceeds);
-            position.current = 'USD';
-            lastTrade.current = Date.now();
-            setSignal('WAIT IN USD');
-            setTrades(t => [{ side: 'SELL', price: p, time: new Date().toLocaleTimeString(), value: proceeds }, ...t].slice(0, 20));
-            return 0;
+          setSignal('BUY BTC');
+          setReason(trade.reason);
+        } else if (a.position === 'BTC' && downCross && a.btc > 0) {
+          const gross = a.btc * newest.close;
+          const fee = gross * FEE;
+          const proceeds = gross - fee;
+          const won = a.entry && newest.close > a.entry;
+          const trade = {
+            side: 'SELL',
+            price: newest.close,
+            value: proceeds,
+            fee,
+            time: new Date(newest.time * 1000).toLocaleString(),
+            reason: 'Fast EMA crossed below slow EMA on a completed one minute candle'
+          };
+          saveAccount({
+            ...a,
+            cash: proceeds,
+            btc: 0,
+            position: 'USD',
+            entry: null,
+            fees: a.fees + fee,
+            wins: a.wins + (won ? 1 : 0),
+            losses: a.losses + (won ? 0 : 1),
+            trades: [trade, ...a.trades].slice(0, 50)
           });
-        } else setSignal(position.current === 'BTC' ? 'HOLD BTC' : 'WAIT IN USD');
-      } catch { setStatus('RECONNECTING'); }
+          setSignal('SELL BTC');
+          setReason(trade.reason);
+        } else {
+          setSignal(a.position === 'BTC' ? 'HOLD BTC' : 'WAIT IN USD');
+          setReason(`Trend ${trend}. No confirmed EMA reversal on the newest candle.`);
+        }
+      } catch {
+        setStatus('RECONNECTING');
+        setReason('Market feed temporarily unavailable');
+      }
     };
+
     load();
-    timer = setInterval(load, 5000);
+    timer = setInterval(load, 10000);
     return () => clearInterval(timer);
   }, []);
 
-  const equity = cash + btc * (price || 0);
+  const equity = account.cash + account.btc * (price || 0);
   const pnl = equity - START;
   const pnlPct = (pnl / START) * 100;
-  const positionLabel = btc > 0 ? 'BTC' : 'USD';
+  const closedTrades = account.wins + account.losses;
+
+  const reset = () => {
+    if (!confirm('Reset the paper account back to $100?')) return;
+    localStorage.removeItem(STORAGE_KEY);
+    saveAccount(initialAccount());
+    setSignal('WAIT IN USD');
+    setReason('Paper account reset. Watching for the next reversal.');
+  };
 
   return <main>
-    <header><div><span className="eyebrow">PAPER TRADING LAB</span><h1>BTC Reversal Trader</h1><p>Follow upward momentum. Step aside when momentum reverses.</p></div><div className="live"><i />{status}</div></header>
+    <header>
+      <div><span className="eyebrow">PAPER TRADING LAB</span><h1>BTC Reversal Trader</h1><p>One minute candles with saved browser paper trading state.</p></div>
+      <div className="live"><i />{status}</div>
+    </header>
+
     <section className="hero">
-      <div><span>BTC / USD</span><strong>{price ? `$${price.toLocaleString(undefined,{maximumFractionDigits:2})}` : 'Loading...'}</strong><small>Coinbase market price</small></div>
-      <div className="signal"><span>CURRENT SIGNAL</span><strong>{signal}</strong><small>Position: {positionLabel}</small></div>
+      <div><span>BTC / USD</span><strong>{price ? `$${price.toLocaleString(undefined,{maximumFractionDigits:2})}` : 'Loading...'}</strong><small>Current Coinbase market price</small></div>
+      <div className="signal"><span>CURRENT SIGNAL</span><strong>{signal}</strong><small>{reason}</small></div>
     </section>
+
     <section className="grid">
       <Card label="PAPER ACCOUNT" value={`$${equity.toFixed(2)}`} sub="Started with $100.00" />
       <Card label="PROFIT / LOSS" value={`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`} sub={`${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%`} good={pnl >= 0} />
-      <Card label="CASH" value={`$${cash.toFixed(2)}`} sub="Available USD" />
-      <Card label="BTC HELD" value={btc.toFixed(8)} sub={entry.current ? `Entry $${entry.current.toLocaleString()}` : 'No open position'} />
+      <Card label="CASH" value={`$${account.cash.toFixed(2)}`} sub="Available USD" />
+      <Card label="BTC HELD" value={account.btc.toFixed(8)} sub={account.entry ? `Entry $${account.entry.toLocaleString()}` : 'No open position'} />
     </section>
-    <section className="panel"><div className="panelHead"><div><span className="eyebrow">AUTOMATED LOG</span><h2>Recent paper trades</h2></div><span className="pill">No real money</span></div>
-      {trades.length === 0 ? <div className="empty">Watching BTC for the first confirmed reversal. The bot will log simulated trades here.</div> : <div className="trades">{trades.map((t,i)=><div className="trade" key={i}><b className={t.side==='BUY'?'buy':'sell'}>{t.side}</b><span>${t.price.toLocaleString()}</span><span>${t.value.toFixed(2)} account</span><time>{t.time}</time></div>)}</div>}
+
+    <section className="panel">
+      <div className="panelHead"><div><span className="eyebrow">ONE MINUTE ENGINE</span><h2>Reversal indicators</h2></div><span className="pill">{candles.length} recent candles</span></div>
+      <div className="indicatorGrid">
+        <Metric label="FAST EMA 7" value={fast ? `$${fast.toFixed(2)}` : 'Loading'} />
+        <Metric label="SLOW EMA 18" value={slow ? `$${slow.toFixed(2)}` : 'Loading'} />
+        <Metric label="POSITION" value={account.position} />
+        <Metric label="FEES PAID" value={`$${account.fees.toFixed(2)}`} />
+        <Metric label="CLOSED CYCLES" value={String(closedTrades)} />
+        <Metric label="WINS / LOSSES" value={`${account.wins} / ${account.losses}`} />
+      </div>
+      <MiniChart candles={candles} />
     </section>
-    <footer>Experimental paper trader. Results are simulations and do not guarantee future returns.</footer>
+
+    <section className="panel">
+      <div className="panelHead"><div><span className="eyebrow">AUTOMATED LOG</span><h2>Recent paper trades</h2></div><button onClick={reset}>Reset $100 account</button></div>
+      {account.trades.length === 0 ? <div className="empty">The bot already has recent candle history and is watching completed one minute candles for the first confirmed reversal.</div> : <div className="trades">{account.trades.map((t,i)=><div className="trade tradeWide" key={i}><b className={t.side==='BUY'?'buy':'sell'}>{t.side}</b><span>${t.price.toLocaleString()}</span><span>${t.value.toFixed(2)}</span><span className="why">{t.reason}</span><time>{t.time}</time></div>)}</div>}
+    </section>
+
+    <footer>Experimental paper trader only. Results are simulations and do not guarantee future returns.</footer>
   </main>;
 }
 
 function Card({label,value,sub,good}) { return <div className="card"><span>{label}</span><strong className={good ? 'positive' : ''}>{value}</strong><small>{sub}</small></div>; }
+function Metric({label,value}) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div>; }
+function MiniChart({ candles }) {
+  if (candles.length < 2) return <div className="chartEmpty">Loading candle chart</div>;
+  const closes = candles.map(c => c.close);
+  const min = Math.min(...closes);
+  const max = Math.max(...closes);
+  const range = max - min || 1;
+  const points = closes.map((v,i) => `${(i/(closes.length-1))*100},${95-((v-min)/range)*90}`).join(' ');
+  return <div className="chartWrap"><svg viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points={points} fill="none" stroke="currentColor" strokeWidth="1.4" vectorEffect="non-scaling-stroke" /></svg><small>Last {candles.length} completed one minute closes</small></div>;
+}
