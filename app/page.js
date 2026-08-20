@@ -25,6 +25,9 @@ export default function Home() {
   const [fast, setFast] = useState(null);
   const [slow, setSlow] = useState(null);
   const [account, setAccount] = useState(initialAccount());
+  const [backtest, setBacktest] = useState(null);
+  const [backtestStatus, setBacktestStatus] = useState('idle');
+  const [backtestError, setBacktestError] = useState('');
   const accountRef = useRef(account);
   const lastCandleRef = useRef(null);
   const loadedRef = useRef(false);
@@ -154,6 +157,21 @@ export default function Home() {
     return () => clearInterval(timer);
   }, []);
 
+  const runBacktest = async () => {
+    setBacktestStatus('loading');
+    setBacktestError('');
+    try {
+      const r = await fetch('/api/backtest', { cache: 'no-store' });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || 'Backtest failed');
+      setBacktest(d);
+      setBacktestStatus('done');
+    } catch (error) {
+      setBacktestStatus('error');
+      setBacktestError(error.message || 'Backtest failed');
+    }
+  };
+
   const equity = account.cash + account.btc * (price || 0);
   const pnl = equity - START;
   const pnlPct = (pnl / START) * 100;
@@ -169,7 +187,7 @@ export default function Home() {
 
   return <main>
     <header>
-      <div><span className="eyebrow">PAPER TRADING LAB</span><h1>BTC Reversal Trader</h1><p>One minute candles with saved browser paper trading state.</p></div>
+      <div><span className="eyebrow">PAPER TRADING LAB</span><h1>BTC Reversal Trader</h1><p>One minute candles with live paper trading and historical testing.</p></div>
       <div className="live"><i />{status}</div>
     </header>
 
@@ -196,6 +214,36 @@ export default function Home() {
         <Metric label="WINS / LOSSES" value={`${account.wins} / ${account.losses}`} />
       </div>
       <MiniChart candles={candles} />
+    </section>
+
+    <section className="panel backtestPanel">
+      <div className="panelHead">
+        <div><span className="eyebrow">HISTORICAL TEST</span><h2>Last 7 days with $100</h2></div>
+        <button onClick={runBacktest} disabled={backtestStatus === 'loading'}>{backtestStatus === 'loading' ? 'Running test...' : backtest ? 'Run again' : 'Run 7 day backtest'}</button>
+      </div>
+      <p className="panelCopy">Uses the same 1 minute EMA 7 and EMA 18 reversal logic and the same simulated fee rate as the live paper trader.</p>
+      {backtestStatus === 'idle' && <div className="empty">Press the button to replay the previous seven days of BTC one minute candles.</div>}
+      {backtestStatus === 'loading' && <div className="empty">Downloading and replaying roughly ten thousand one minute BTC candles. This can take a little while.</div>}
+      {backtestStatus === 'error' && <div className="empty errorText">Backtest could not finish: {backtestError}</div>}
+      {backtest && <>
+        <div className="backtestGrid">
+          <Metric label="START" value={`$${backtest.startBalance.toFixed(2)}`} />
+          <Metric label="BOT ENDING" value={`$${backtest.endingBalance.toFixed(2)}`} />
+          <Metric label="BOT RETURN" value={`${backtest.returnPct >= 0 ? '+' : ''}${backtest.returnPct.toFixed(2)}%`} />
+          <Metric label="BUY AND HOLD" value={`$${backtest.buyHoldEnding.toFixed(2)}`} />
+          <Metric label="VS HOLD" value={`${backtest.differenceVsHold >= 0 ? '+' : ''}$${backtest.differenceVsHold.toFixed(2)}`} />
+          <Metric label="FEES" value={`$${backtest.fees.toFixed(2)}`} />
+          <Metric label="TRADES" value={String(backtest.trades)} />
+          <Metric label="CYCLES" value={String(backtest.closedCycles)} />
+          <Metric label="WIN RATE" value={`${backtest.winRate.toFixed(1)}%`} />
+          <Metric label="MAX DRAWDOWN" value={`${backtest.maxDrawdown.toFixed(2)}%`} />
+        </div>
+        <div className="backtestSummary">
+          <strong>{backtest.endingBalance > backtest.buyHoldEnding ? 'The reversal bot beat buy and hold for this seven day window.' : 'Buy and hold beat the reversal bot for this seven day window.'}</strong>
+          <span>{backtest.candles.toLocaleString()} one minute candles tested. BTC moved from ${backtest.firstPrice.toLocaleString(undefined,{maximumFractionDigits:2})} to ${backtest.lastPrice.toLocaleString(undefined,{maximumFractionDigits:2})}.</span>
+        </div>
+        {backtest.recentTrades?.length > 0 && <div className="trades backtestTrades">{backtest.recentTrades.slice(0,12).map((t,i)=><div className="trade" key={`${t.time}-${i}`}><b className={t.side === 'BUY' ? 'buy' : 'sell'}>{t.side}</b><span>${t.price.toLocaleString(undefined,{maximumFractionDigits:2})}</span><span>{new Date(t.time * 1000).toLocaleString()}</span><time>{t.side === 'SELL' && typeof t.cycleReturn === 'number' ? `${t.cycleReturn >= 0 ? '+' : ''}${t.cycleReturn.toFixed(2)}% cycle` : `$${t.fee.toFixed(2)} fee`}</time></div>)}</div>}
+      </>}
     </section>
 
     <section className="panel">
