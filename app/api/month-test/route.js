@@ -4,15 +4,16 @@ export const maxDuration = 60;
 const START = 100;
 const FEE = 0.006;
 const DAY = 86400;
-const WINDOW = 280 * 60;
+const GRANULARITY = 900;
+const WINDOW = 280 * GRANULARITY;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fetchWindow(start, end, attempt = 0) {
-  const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=${new Date(start * 1000).toISOString()}&end=${new Date(end * 1000).toISOString()}`;
+  const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=${GRANULARITY}&start=${new Date(start * 1000).toISOString()}&end=${new Date(end * 1000).toISOString()}`;
   const res = await fetch(url, { headers:{Accept:'application/json'}, cache:'no-store' });
   if (res.status === 429 && attempt < 7) {
     const retry = Number(res.headers.get('retry-after'));
-    await sleep(Number.isFinite(retry) && retry > 0 ? retry * 1000 : 1200 * (attempt + 1));
+    await sleep(Number.isFinite(retry) && retry > 0 ? retry * 1000 : 900 * (attempt + 1));
     return fetchWindow(start, end, attempt + 1);
   }
   if (!res.ok) throw new Error(`Coinbase history ${res.status}`);
@@ -21,18 +22,19 @@ async function fetchWindow(start, end, attempt = 0) {
 }
 
 async function fetchThirtyDays() {
-  const end = Math.floor(Date.now()/60000)*60;
+  const end = Math.floor(Date.now()/GRANULARITY)*GRANULARITY;
   const start = end - 30*DAY;
   const all=[];
   for (let cursor=start; cursor<end; cursor+=WINDOW) {
     all.push(...await fetchWindow(cursor, Math.min(cursor+WINDOW,end)));
-    await sleep(450);
+    await sleep(150);
   }
   const map=new Map(); all.forEach(c=>map.set(c.time,c));
   return [...map.values()].filter(c=>c.time>=start&&c.time<end).sort((a,b)=>a.time-b.time);
 }
 
 function aggregate(candles, minutes) {
+  if (minutes === 15) return candles;
   const size=minutes*60, groups=new Map();
   for (const c of candles) {
     const key=Math.floor(c.time/size)*size, g=groups.get(key);
@@ -45,17 +47,17 @@ function emaNext(prev,value,period){const k=2/(period+1);return value*k+prev*(1-
 
 function simulate(candles,cfg){
   let cash=START,btc=0,position='USD',entry=0,entryCapital=0,fast=candles[0].close,slow=fast,prevFast=fast,prevSlow=slow;
-  let fees=0,trades=0,wins=0,losses=0,barsHeld=0,cooldown=0,peak=START,maxDrawdown=0,highestSinceEntry=0;
+  let fees=0,trades=0,wins=0,losses=0,barsHeld=0,cooldown=0,peak=START,maxDrawdown=0;
   for(let i=1;i<candles.length;i++){
     const c=candles[i]; prevFast=fast;prevSlow=slow;fast=emaNext(fast,c.close,cfg.fast);slow=emaNext(slow,c.close,cfg.slow);
-    if(cooldown>0)cooldown--; if(position==='BTC'){barsHeld++;highestSinceEntry=Math.max(highestSinceEntry,c.high);}
+    if(cooldown>0)cooldown--; if(position==='BTC')barsHeld++;
     if(i>=cfg.slow){
       const spread=Math.abs(fast-slow)/c.close,upCross=fast>slow&&prevFast<=prevSlow&&spread>=cfg.confirm,downCross=fast<slow&&prevFast>=prevSlow;
-      if(position==='USD'&&cooldown===0&&upCross){entryCapital=cash;const fee=cash*FEE;btc=(cash-fee)/c.close;fees+=fee;cash=0;entry=c.close;highestSinceEntry=c.high;position='BTC';trades++;barsHeld=0;}
+      if(position==='USD'&&cooldown===0&&upCross){entryCapital=cash;const fee=cash*FEE;btc=(cash-fee)/c.close;fees+=fee;cash=0;entry=c.close;position='BTC';trades++;barsHeld=0;}
       else if(position==='BTC'){
         const returnPct=c.close/entry-1,stopHit=returnPct<=-cfg.stop,profitReady=returnPct>=cfg.minProfit;
         if(barsHeld>=2&&((downCross&&(profitReady||stopHit))||stopHit)){
-          const gross=btc*c.close,fee=gross*FEE;cash=gross-fee;fees+=fee;btc=0;trades++;if(cash>entryCapital)wins++;else losses++;position='USD';cooldown=2;entry=0;entryCapital=0;highestSinceEntry=0;barsHeld=0;
+          const gross=btc*c.close,fee=gross*FEE;cash=gross-fee;fees+=fee;btc=0;trades++;if(cash>entryCapital)wins++;else losses++;position='USD';cooldown=2;entry=0;entryCapital=0;barsHeld=0;
         }
       }
     }
@@ -67,7 +69,7 @@ function simulate(candles,cfg){
 
 export async function GET(){
   try{
-    const raw=await fetchThirtyDays(); if(raw.length<30000)throw new Error('Not enough 30 day history returned');
+    const raw=await fetchThirtyDays(); if(raw.length<2500)throw new Error('Not enough 30 day history returned');
     const configs=[
       {name:'7 day winner',minutes:30,fast:3,slow:18,confirm:0.0005,minProfit:0.006,stop:0.025},
       {name:'Runner up',minutes:30,fast:3,slow:18,confirm:0.0005,minProfit:0.012,stop:0.025},
@@ -78,6 +80,6 @@ export async function GET(){
     ];
     const cache=new Map(); const results=configs.map(cfg=>{if(!cache.has(cfg.minutes))cache.set(cfg.minutes,aggregate(raw,cfg.minutes));return simulate(cache.get(cfg.minutes),cfg);}).sort((a,b)=>b.endingBalance-a.endingBalance);
     const first=raw[0].close,last=raw[raw.length-1].close,buyHoldEnding=START*last/first;
-    return Response.json({startBalance:START,feeRate:FEE,candles:raw.length,days:30,firstPrice:first,lastPrice:last,buyHoldEnding,buyHoldReturnPct:(buyHoldEnding/START-1)*100,best:results[0],results});
+    return Response.json({startBalance:START,feeRate:FEE,candles:raw.length,candleMinutes:15,days:30,firstPrice:first,lastPrice:last,buyHoldEnding,buyHoldReturnPct:(buyHoldEnding/START-1)*100,best:results[0],results});
   }catch(error){return Response.json({error:error.message},{status:502});}
 }
