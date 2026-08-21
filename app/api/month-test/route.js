@@ -4,7 +4,7 @@ export const maxDuration = 60;
 const START = 100;
 const FEE = 0.006;
 const DAY = 86400;
-const GRANULARITY = 900;
+const GRANULARITY = 300;
 const WINDOW = 280 * GRANULARITY;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -16,7 +16,10 @@ async function fetchWindow(start, end, attempt = 0) {
     await sleep(Number.isFinite(retry) && retry > 0 ? retry * 1000 : 900 * (attempt + 1));
     return fetchWindow(start, end, attempt + 1);
   }
-  if (!res.ok) throw new Error(`Coinbase history ${res.status}`);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Coinbase history ${res.status}${detail ? `: ${detail.slice(0,120)}` : ''}`);
+  }
   const rows = await res.json();
   return rows.map(([time,low,high,open,close,volume]) => ({time:+time,low:+low,high:+high,open:+open,close:+close,volume:+volume}));
 }
@@ -26,15 +29,15 @@ async function fetchThirtyDays() {
   const start = end - 30*DAY;
   const all=[];
   for (let cursor=start; cursor<end; cursor+=WINDOW) {
-    all.push(...await fetchWindow(cursor, Math.min(cursor+WINDOW,end)));
-    await sleep(150);
+    const requestEnd = Math.min(cursor + WINDOW - GRANULARITY, end - GRANULARITY);
+    all.push(...await fetchWindow(cursor, requestEnd));
+    await sleep(120);
   }
   const map=new Map(); all.forEach(c=>map.set(c.time,c));
   return [...map.values()].filter(c=>c.time>=start&&c.time<end).sort((a,b)=>a.time-b.time);
 }
 
 function aggregate(candles, minutes) {
-  if (minutes === 15) return candles;
   const size=minutes*60, groups=new Map();
   for (const c of candles) {
     const key=Math.floor(c.time/size)*size, g=groups.get(key);
@@ -69,7 +72,7 @@ function simulate(candles,cfg){
 
 export async function GET(){
   try{
-    const raw=await fetchThirtyDays(); if(raw.length<2500)throw new Error('Not enough 30 day history returned');
+    const raw=await fetchThirtyDays(); if(raw.length<8000)throw new Error(`Not enough 30 day history returned: ${raw.length} candles`);
     const configs=[
       {name:'7 day winner',minutes:30,fast:3,slow:18,confirm:0.0005,minProfit:0.006,stop:0.025},
       {name:'Runner up',minutes:30,fast:3,slow:18,confirm:0.0005,minProfit:0.012,stop:0.025},
@@ -80,6 +83,6 @@ export async function GET(){
     ];
     const cache=new Map(); const results=configs.map(cfg=>{if(!cache.has(cfg.minutes))cache.set(cfg.minutes,aggregate(raw,cfg.minutes));return simulate(cache.get(cfg.minutes),cfg);}).sort((a,b)=>b.endingBalance-a.endingBalance);
     const first=raw[0].close,last=raw[raw.length-1].close,buyHoldEnding=START*last/first;
-    return Response.json({startBalance:START,feeRate:FEE,candles:raw.length,candleMinutes:15,days:30,firstPrice:first,lastPrice:last,buyHoldEnding,buyHoldReturnPct:(buyHoldEnding/START-1)*100,best:results[0],results});
+    return Response.json({startBalance:START,feeRate:FEE,candles:raw.length,candleMinutes:5,days:30,firstPrice:first,lastPrice:last,buyHoldEnding,buyHoldReturnPct:(buyHoldEnding/START-1)*100,best:results[0],results});
   }catch(error){return Response.json({error:error.message},{status:502});}
 }
